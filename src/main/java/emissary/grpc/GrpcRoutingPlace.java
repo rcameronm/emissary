@@ -2,7 +2,7 @@ package emissary.grpc;
 
 import emissary.config.Configurator;
 import emissary.grpc.channel.ChannelManager;
-import emissary.grpc.channel.PooledChannelManager;
+import emissary.grpc.channel.spi.ChannelManagerFactory;
 import emissary.grpc.invoker.GrpcInvoker;
 import emissary.grpc.retry.RetryHandler;
 import emissary.place.ServiceProviderPlace;
@@ -108,11 +108,11 @@ public abstract class GrpcRoutingPlace extends ServiceProviderPlace implements I
                     "Missing required arguments: %s${Target-ID} and %s${Target-ID}", GRPC_HOST, GRPC_PORT));
         }
 
+        ChannelManagerFactory channelManagerFactory = new ChannelManagerFactory(configG);
         RetryHandler retryHandler = new RetryHandler(configG, this.getPlaceName(), this::retryOnException, this::retryOnResult);
         for (String id : targetIds) {
-            ChannelManager channelManager = new PooledChannelManager(hosts.get(id), ports.get(id), configG);
-            GrpcInvoker grpcInvoker = new GrpcInvoker(channelManager, retryHandler);
-            invokerTable.put(id, grpcInvoker);
+            ChannelManager channelManager = channelManagerFactory.build(hosts.get(id), ports.get(id), configG);
+            invokerTable.put(id, new GrpcInvoker(channelManager, retryHandler));
         }
     }
 
@@ -138,7 +138,7 @@ public abstract class GrpcRoutingPlace extends ServiceProviderPlace implements I
             StatusRuntimeException e = (StatusRuntimeException) t;
             return RETRY_GRPC_CODES.contains(e.getStatus().getCode());
         }
-        return false;
+        return t instanceof ChannelManager.ChannelException;
     }
 
     /**

@@ -144,4 +144,15 @@ public abstract class ChannelManager implements AutoCloseable {
             return policy;
         }
     }
+
+    /**
+     * Exception type for failures with handling the gRPC connection pool, such as failed borrows.
+     */
+    public static class ChannelException extends RuntimeException {
+        private static final long serialVersionUID = 3997386404035396614L;
+
+        public ChannelException(String errorMessage, Throwable err) {
+            super(errorMessage, err);
+        }
+    }
 }
