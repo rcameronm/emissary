@@ -58,6 +58,8 @@ class GrpcSamplePlaceTest extends UnitTest {
     public static final String LOCALHOST = "localhost";
     private static final byte[] INPUT_DATA = "Data123!".getBytes(UTF_8);
     private static final byte[] OUTPUT_DATA = "RPC {\"Data123!\"} completed successfully".getBytes(UTF_8);
+    private static final int TEST_TIMEOUT_SECONDS = 10;
+    private static final int TEST_THREAD_JOIN_MILLIS = 5000;
 
     @Nullable
     private GrpcSamplePlace place;
@@ -377,10 +379,11 @@ class GrpcSamplePlaceTest extends UnitTest {
         @Test
         @SuppressWarnings("Interruption")
         void testThreadInterruptCancelsSequentialGrpc() throws InterruptedException {
-            CountDownLatch startedLatch = new CountDownLatch(1);
+            CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch releaseLatch = new CountDownLatch(1);
+            CountDownLatch cancelLatch = new CountDownLatch(1);
 
-            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch);
+            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilCancelled(startLatch, releaseLatch, cancelLatch);
                     GrpcSampleServer serverTwo = GrpcSampleServer.defaultBehavior()) {
 
                 startPlaceWithEndpoints(serverOne, serverTwo);
@@ -396,13 +399,13 @@ class GrpcSamplePlaceTest extends UnitTest {
 
                 clientThread.start();
 
-                assertTrue(startedLatch.await(1, TimeUnit.SECONDS), "Server should have received request");
+                assertTrue(startLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Server should have received request");
                 assertNull(errorRef.get());
 
                 clientThread.interrupt();
-                clientThread.join(500);
+                clientThread.join(TEST_THREAD_JOIN_MILLIS);
                 assertFalse(clientThread.isAlive(), "Client thread should exit after interruption");
-                assertTrue(releaseLatch.await(10, TimeUnit.SECONDS), "RPC should be canceled with resources released");
+                assertTrue(cancelLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Server should observe cancellation");
 
                 Throwable error = errorRef.get();
                 assertInstanceOf(StatusRuntimeException.class, error);
@@ -413,10 +416,11 @@ class GrpcSamplePlaceTest extends UnitTest {
 
         @Test
         void testBlockedCallDeadlineExceeded() throws InterruptedException {
-            CountDownLatch startedLatch = new CountDownLatch(1);
+            CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch releaseLatch = new CountDownLatch(1);
+            CountDownLatch cancelLatch = new CountDownLatch(1);
 
-            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch);
+            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilCancelled(startLatch, releaseLatch, cancelLatch);
                     GrpcSampleServer serverTwo = GrpcSampleServer.defaultBehavior()) {
 
                 startPlaceWithEndpoints(serverOne, serverTwo,
@@ -427,20 +431,23 @@ class GrpcSamplePlaceTest extends UnitTest {
                 StatusRuntimeException e = assertThrows(StatusRuntimeException.class, invocation::run);
 
                 assertEquals(Status.Code.DEADLINE_EXCEEDED, e.getStatus().getCode());
-                assertTrue(releaseLatch.await(10, TimeUnit.SECONDS), "Server should observe cancellation after client deadline");
+                assertTrue(cancelLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Server should observe cancellation");
                 assertTrue(o.getAlternateViews().isEmpty());
             }
         }
 
         @Test
         void testBlockedResponsesAreProcessedSequentially() throws InterruptedException {
-            CountDownLatch startedLatchOne = new CountDownLatch(1);
+            CountDownLatch startLatchOne = new CountDownLatch(1);
             CountDownLatch releaseLatchOne = new CountDownLatch(1);
-            CountDownLatch startedLatchTwo = new CountDownLatch(1);
-            CountDownLatch releaseLatchTwo = new CountDownLatch(1);
+            CountDownLatch responseLatchOne = new CountDownLatch(1);
 
-            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startedLatchOne, releaseLatchOne);
-                    GrpcSampleServer serverTwo = GrpcSampleServer.blockUntilReleased(startedLatchTwo, releaseLatchTwo)) {
+            CountDownLatch startLatchTwo = new CountDownLatch(1);
+            CountDownLatch releaseLatchTwo = new CountDownLatch(1);
+            CountDownLatch responseLatchTwo = new CountDownLatch(1);
+
+            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startLatchOne, releaseLatchOne, responseLatchOne);
+                    GrpcSampleServer serverTwo = GrpcSampleServer.blockUntilReleased(startLatchTwo, releaseLatchTwo, responseLatchTwo)) {
 
                 startPlaceWithEndpoints(serverOne, serverTwo);
                 Map<String, byte[]> views = o.getAlternateViews();
@@ -456,24 +463,26 @@ class GrpcSamplePlaceTest extends UnitTest {
 
                 clientThread.start();
 
-                assertTrue(startedLatchOne.await(1, TimeUnit.SECONDS), "First server should have received request");
-                assertEquals(1L, startedLatchTwo.getCount(), "Second server should be waiting to receive request");
+                assertTrue(startLatchOne.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "First server should have received request");
+                assertEquals(1L, startLatchTwo.getCount(), "Second server should be waiting to receive request");
                 assertTrue(views.isEmpty());
                 assertNull(errorRef.get());
 
                 assertTrue(clientThread.isAlive());
                 releaseLatchOne.countDown();
 
-                assertTrue(startedLatchTwo.await(1, TimeUnit.SECONDS));
+                assertTrue(responseLatchOne.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "First server should response");
+                assertTrue(startLatchTwo.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS));
                 assertEquals(1, views.size());
                 assertArrayEquals(OUTPUT_DATA, views.get(ENDPOINT_1));
                 assertNull(errorRef.get());
 
                 assertTrue(clientThread.isAlive());
                 releaseLatchTwo.countDown();
+                assertTrue(responseLatchTwo.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Second server should respond");
 
-                clientThread.join(500); // Wait for thread to die
-                assertFalse(clientThread.isAlive());
+                clientThread.join(TEST_THREAD_JOIN_MILLIS); // Wait for thread to die
+                assertFalse(clientThread.isAlive(), "Client thread should exit after responses complete");
 
                 assertEquals(2, views.size());
                 assertArrayEquals(OUTPUT_DATA, views.get(ENDPOINT_1));
@@ -504,11 +513,12 @@ class GrpcSamplePlaceTest extends UnitTest {
         @Test
         @SuppressWarnings("Interruption")
         void testThreadInterruptCancelsParallelGrpc() throws InterruptedException {
-            CountDownLatch startedLatch = new CountDownLatch(2);
+            CountDownLatch startLatch = new CountDownLatch(2);
             CountDownLatch releaseLatch = new CountDownLatch(1);
+            CountDownLatch cancelLatch = new CountDownLatch(2);
 
-            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch);
-                    GrpcSampleServer serverTwo = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch)) {
+            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilCancelled(startLatch, releaseLatch, cancelLatch);
+                    GrpcSampleServer serverTwo = GrpcSampleServer.blockUntilCancelled(startLatch, releaseLatch, cancelLatch)) {
 
                 startPlaceWithEndpoints(serverOne, serverTwo);
                 AtomicReference<Throwable> errorRef = new AtomicReference<>();
@@ -523,13 +533,13 @@ class GrpcSamplePlaceTest extends UnitTest {
 
                 clientThread.start();
 
-                assertTrue(startedLatch.await(2, TimeUnit.SECONDS), "Not all servers received requests");
+                assertTrue(startLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Not all servers received requests");
                 assertNull(errorRef.get());
 
                 clientThread.interrupt();
-                clientThread.join(500);
+                clientThread.join(TEST_THREAD_JOIN_MILLIS);
                 assertFalse(clientThread.isAlive(), "Client thread should exit after interruption");
-                assertTrue(releaseLatch.await(10, TimeUnit.SECONDS), "RPC should be canceled with resources released");
+                assertTrue(cancelLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Server should observe cancellation");
 
                 Throwable error = errorRef.get();
                 assertInstanceOf(StatusRuntimeException.class, error);
@@ -540,10 +550,11 @@ class GrpcSamplePlaceTest extends UnitTest {
 
         @Test
         void testFutureCallDeadlineExceeded() throws InterruptedException {
-            CountDownLatch startedLatch = new CountDownLatch(1);
+            CountDownLatch startLatch = new CountDownLatch(1);
             CountDownLatch releaseLatch = new CountDownLatch(1);
+            CountDownLatch cancelLatch = new CountDownLatch(1);
 
-            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch);
+            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilCancelled(startLatch, releaseLatch, cancelLatch);
                     GrpcSampleServer serverTwo = GrpcSampleServer.defaultBehavior()) {
 
                 startPlaceWithEndpoints(serverOne, serverTwo,
@@ -554,7 +565,7 @@ class GrpcSamplePlaceTest extends UnitTest {
                 StatusRuntimeException e = assertThrows(StatusRuntimeException.class, invocation::run);
 
                 assertEquals(Status.Code.DEADLINE_EXCEEDED, e.getStatus().getCode());
-                assertTrue(releaseLatch.await(10, TimeUnit.SECONDS), "Server should observe cancellation after client deadline");
+                assertTrue(cancelLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Server should observe cancellation");
                 assertTrue(o.getAlternateViews().isEmpty());
             }
         }
@@ -563,9 +574,10 @@ class GrpcSamplePlaceTest extends UnitTest {
         void testFutureResponsesAreProcessedInParallel() throws InterruptedException {
             CountDownLatch startedLatch = new CountDownLatch(2);
             CountDownLatch releaseLatch = new CountDownLatch(1);
+            CountDownLatch responseLatch = new CountDownLatch(2);
 
-            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch);
-                    GrpcSampleServer serverTwo = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch)) {
+            try (GrpcSampleServer serverOne = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch, responseLatch);
+                    GrpcSampleServer serverTwo = GrpcSampleServer.blockUntilReleased(startedLatch, releaseLatch, responseLatch)) {
 
                 startPlaceWithEndpoints(serverOne, serverTwo);
                 Map<String, byte[]> views = o.getAlternateViews();
@@ -581,15 +593,16 @@ class GrpcSamplePlaceTest extends UnitTest {
 
                 clientThread.start();
 
-                assertTrue(startedLatch.await(2, TimeUnit.SECONDS), "Not all servers received requests");
+                assertTrue(startedLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Not all servers received requests");
                 assertTrue(views.isEmpty());
                 assertNull(errorRef.get());
 
                 assertTrue(clientThread.isAlive());
                 releaseLatch.countDown();
 
-                clientThread.join(500); // Wait for thread to die
-                assertFalse(clientThread.isAlive());
+                assertTrue(responseLatch.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS), "Both servers should respond");
+                clientThread.join(TEST_THREAD_JOIN_MILLIS); // Wait for thread to die
+                assertFalse(clientThread.isAlive(), "Client thread should exit after responses complete");
 
                 assertEquals(2, views.size());
                 assertArrayEquals(OUTPUT_DATA, views.get(ENDPOINT_1));

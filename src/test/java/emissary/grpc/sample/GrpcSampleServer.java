@@ -89,22 +89,41 @@ public class GrpcSampleServer implements AutoCloseable {
         });
     }
 
-    public static GrpcSampleServer blockUntilReleased(CountDownLatch startedLatch, CountDownLatch releaseLatch) {
+    public static GrpcSampleServer blockUntilCancelled(
+            CountDownLatch startLatch, CountDownLatch releaseLatch, CountDownLatch cancelLatch) {
+        return GrpcSampleServer.of(request -> {
+            Context context = Context.current();
+            context.addListener(ignored -> cancelLatch.countDown(), MoreExecutors.directExecutor());
+            context.addListener(ignored -> releaseLatch.countDown(), MoreExecutors.directExecutor());
+            return awaitRelease(request, context, startLatch, releaseLatch);
+        });
+    }
+
+    public static GrpcSampleServer blockUntilReleased(
+            CountDownLatch startLatch, CountDownLatch releaseLatch, CountDownLatch responseLatch) {
         return GrpcSampleServer.of(request -> {
             Context context = Context.current();
             context.addListener(ignored -> releaseLatch.countDown(), MoreExecutors.directExecutor());
-            startedLatch.countDown();
-            try {
-                releaseLatch.await(); // If stuck, naturally terminates upon server shutdown due to context listener
-                if (context.isCancelled()) {
-                    return ByteString.EMPTY;
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw Status.CANCELLED.asRuntimeException();
+            ByteString response = awaitRelease(request, context, startLatch, releaseLatch);
+            if (!context.isCancelled()) {
+                responseLatch.countDown();
             }
-            return success(request);
+            return response;
         });
+    }
+
+    private static ByteString awaitRelease(SampleRequest request, Context context, CountDownLatch startLatch, CountDownLatch releaseLatch) {
+        startLatch.countDown();
+        try {
+            releaseLatch.await(); // If stuck, naturally terminates upon server shutdown due to context listener
+            if (context.isCancelled()) {
+                return ByteString.EMPTY;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw Status.CANCELLED.asRuntimeException();
+        }
+        return success(request);
     }
 
     public static GrpcSampleServer countTries(ByteString message, AtomicInteger counter) {
